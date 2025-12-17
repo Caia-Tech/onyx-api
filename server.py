@@ -14,8 +14,11 @@ import asyncio
 import sys
 import time
 import json
+import os
+from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, List, Dict, Any, AsyncGenerator
+from typing import Optional, List, Dict, Any, AsyncGenerator, Tuple
 from contextlib import asynccontextmanager
 
 import torch
@@ -23,13 +26,14 @@ import torch.nn.functional as F
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 # Add model path to sys.path
 MODEL_DIR = Path(__file__).parent.parent.parent / "models" / "onyx"
 sys.path.insert(0, str(MODEL_DIR))
 
 from onyx_model import Onyx, OnyxConfig
+from onyx_inference import load_model as load_onyx_model
 
 try:
     from transformers import AutoTokenizer
@@ -42,16 +46,31 @@ except ImportError:
 # =============================================================================
 
 class ServerConfig:
-    checkpoint_path: str = str(MODEL_DIR / "checkpoints" / "checkpoint_step_1000.pt")
-    model_config_path: str = str(MODEL_DIR / "models" / "150m" / "config.json")
-    tokenizer_name: str = "NousResearch/Hermes-2-Pro-Llama-3-8B"
-    device: str = "auto"  # auto, cuda, mps, cpu
-    dtype: str = "float32"  # float32, float16, bfloat16
+    checkpoint_path: str = os.environ.get(
+        "ONYX_CHECKPOINT_PATH",
+        str(MODEL_DIR / "checkpoints" / "checkpoint_step_1000.pt"),
+    )
+    model_config_path: str = os.environ.get(
+        "ONYX_MODEL_CONFIG_PATH",
+        str(MODEL_DIR / "models" / "150m" / "config.json"),
+    )
+    tokenizer_name: str = os.environ.get("ONYX_TOKENIZER_NAME", "NousResearch/Hermes-2-Pro-Llama-3-8B")
+    device: str = os.environ.get("ONYX_DEVICE", "auto")  # auto, cuda, mps, cpu
+    dtype: str = os.environ.get("ONYX_DTYPE", "float32")  # float32, float16, bfloat16
     max_seq_len: int = 4096
     default_max_tokens: int = 512
     default_temperature: float = 0.8
     default_top_p: float = 0.9
     default_top_k: int = 50
+    allow_local_paths: bool = os.environ.get("ONYX_ALLOW_LOCAL_PATHS", "0") == "1"
+    allowed_path_prefixes: str = os.environ.get("ONYX_ALLOWED_PATH_PREFIXES", str(MODEL_DIR))
+    model_cache_size: int = int(os.environ.get("ONYX_MODEL_CACHE_SIZE", "2"))
+    skip_startup_load: bool = os.environ.get("ONYX_SKIP_LOAD", "0") == "1"
+    registry_url: Optional[str] = os.environ.get("ONYX_REGISTRY_URL") or None
+    registry_api_key: Optional[str] = os.environ.get("ONYX_REGISTRY_API_KEY") or None
+    artifact_cache_url: Optional[str] = os.environ.get("ONYX_ARTIFACT_CACHE_URL") or None
+    artifact_cache_api_key: Optional[str] = os.environ.get("ONYX_ARTIFACT_CACHE_API_KEY") or None
+    min_registry_status: str = os.environ.get("ONYX_MIN_REGISTRY_STATUS", "experimental")
 
 
 config = ServerConfig()
@@ -62,13 +81,17 @@ config = ServerConfig()
 # =============================================================================
 
 class ModelState:
+    # Default (startup) bundle
     model: Optional[Onyx] = None
     tokenizer: Any = None
-    device: torch.device = None
-    dtype: torch.dtype = None
+    device: Optional[torch.device] = None
+    dtype: Optional[torch.dtype] = None
     config: Optional[OnyxConfig] = None
-    # Session memory states keyed by session_id
-    sessions: Dict[str, List[Dict[str, Any]]] = {}
+
+    manager: Optional["ModelManager"] = None
+
+    # Session memory states keyed by model_key -> session_id
+    sessions: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
 
 
 state = ModelState()
@@ -78,78 +101,324 @@ state = ModelState()
 # Model Loading
 # =============================================================================
 
-def load_model_config(config_path: str) -> OnyxConfig:
-    """Load model config from JSON file"""
-    import dataclasses
-
-    with open(config_path) as f:
-        cfg_json = json.load(f)
-
-    flat_cfg = {}
-    for key, value in cfg_json.items():
-        if isinstance(value, dict):
-            flat_cfg.update(value)
-        else:
-            flat_cfg[key] = value
-
-    valid_fields = {f.name for f in dataclasses.fields(OnyxConfig)}
-    filtered_cfg = {k: v for k, v in flat_cfg.items() if k in valid_fields}
-    return OnyxConfig(**filtered_cfg)
-
-
-def load_model():
-    """Load model and tokenizer"""
-    print(f"Loading model config from: {config.model_config_path}")
-    model_config = load_model_config(config.model_config_path)
-    state.config = model_config
-
-    # Setup device
+def _select_device() -> torch.device:
     if config.device == "auto":
         if torch.cuda.is_available():
-            device = torch.device("cuda")
-        elif torch.backends.mps.is_available():
-            device = torch.device("mps")
-        else:
-            device = torch.device("cpu")
-    else:
-        device = torch.device(config.device)
-    state.device = device
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    return torch.device(config.device)
 
-    # Setup dtype
+
+def _select_dtype() -> torch.dtype:
     dtype_map = {
         "float32": torch.float32,
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
     }
-    state.dtype = dtype_map[config.dtype]
+    if config.dtype not in dtype_map:
+        raise RuntimeError(f"Unsupported dtype: {config.dtype}")
+    return dtype_map[config.dtype]
 
-    print(f"Device: {device} | Dtype: {state.dtype}")
 
-    # Load tokenizer
-    print(f"Loading tokenizer: {config.tokenizer_name}")
-    state.tokenizer = AutoTokenizer.from_pretrained(
-        config.tokenizer_name,
-        trust_remote_code=True
+def _allowed_prefixes() -> List[Path]:
+    prefixes: List[Path] = []
+    for raw in (config.allowed_path_prefixes or "").split(","):
+        raw = raw.strip()
+        if raw:
+            prefixes.append(Path(raw).expanduser().resolve())
+    if not prefixes:
+        prefixes = [MODEL_DIR.resolve()]
+    return prefixes
+
+
+def _is_allowed_local_path(p: Path) -> bool:
+    rp = p.expanduser().resolve()
+    for base in _allowed_prefixes():
+        try:
+            rp.relative_to(base)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _normalize_local_path(raw: str) -> Path:
+    s = (raw or "").strip()
+    if "://" in s and not s.startswith("file://"):
+        raise HTTPException(status_code=400, detail=f"Remote URI not supported here: {raw}")
+    if s.startswith("file://"):
+        s = s[len("file://") :]
+    return Path(s).expanduser().resolve()
+
+
+@dataclass(frozen=True)
+class ModelSelector:
+    model_id: Optional[int] = None
+    artifact_uri: Optional[str] = None
+    checkpoint_path: Optional[str] = None
+    model_config_path: Optional[str] = None
+    checkpoint_sha256: Optional[str] = None
+    checkpoint_size_bytes: Optional[int] = None
+    config_sha256: Optional[str] = None
+    config_size_bytes: Optional[int] = None
+    registry_status: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ModelKey:
+    checkpoint_path: str
+    model_config_path: Optional[str]
+    device: str
+    dtype: str
+
+
+@dataclass
+class ModelBundle:
+    key: ModelKey
+    model: Onyx
+    tokenizer: Any
+    device: torch.device
+    dtype: torch.dtype
+    config: OnyxConfig
+
+
+class ModelManager:
+    def __init__(self, *, tokenizer: Any, device: torch.device, dtype: torch.dtype):
+        self._tokenizer = tokenizer
+        self._device = device
+        self._dtype = dtype
+        self._lock = asyncio.Lock()
+        self._inflight: Dict[ModelKey, asyncio.Future[ModelBundle]] = {}
+        self._cache: "OrderedDict[ModelKey, ModelBundle]" = OrderedDict()
+
+    def _key_id(self, key: ModelKey) -> str:
+        return f"{key.device}:{key.dtype}:{key.checkpoint_path}|{key.model_config_path or ''}"
+
+    async def _fetch_registry_model(self, model_id: int) -> Optional[dict]:
+        if not config.registry_url:
+            return None
+        import httpx
+
+        headers: Dict[str, str] = {}
+        if config.registry_api_key:
+            headers["X-API-Key"] = config.registry_api_key
+        url = config.registry_url.rstrip("/") + f"/models/{model_id}"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(url, headers=headers)
+            r.raise_for_status()
+            data = r.json()
+        return data if isinstance(data, dict) else None
+
+    def _registry_status_ok(self, status: Optional[str]) -> bool:
+        if status is None:
+            return True
+        order = {"experimental": 0, "staging": 1, "production": 2, "archived": -1}
+        min_status = (config.min_registry_status or "experimental").strip().lower()
+        if min_status not in order:
+            min_status = "experimental"
+        s = status.strip().lower()
+        if s not in order:
+            return True
+        if s == "archived":
+            return False
+        return order[s] >= order[min_status]
+
+    async def _resolve_via_artifact_cache(self, *, artifact_uri: str, sha256: str, size_bytes: int) -> str:
+        if not config.artifact_cache_url:
+            raise HTTPException(
+                status_code=400,
+                detail="Remote artifacts require ONYX_ARTIFACT_CACHE_URL (artifact cache service)",
+            )
+        import httpx
+
+        base = config.artifact_cache_url.rstrip("/")
+        url = base if base.endswith("/resolve") else base + "/resolve"
+        headers: Dict[str, str] = {}
+        if config.artifact_cache_api_key:
+            headers["X-API-Key"] = config.artifact_cache_api_key
+        payload = {"artifact_uri": artifact_uri, "sha256": sha256, "size_bytes": int(size_bytes)}
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(url, json=payload, headers=headers)
+            r.raise_for_status()
+            data = r.json()
+        if not isinstance(data, dict) or not isinstance(data.get("local_path"), str):
+            raise HTTPException(status_code=502, detail="Artifact cache returned invalid response")
+        return data["local_path"]
+
+    async def _resolve_selector(self, selector: ModelSelector) -> ModelSelector:
+        # If model_id is provided but paths are missing, optionally resolve via registry.
+        if selector.model_id is None:
+            return selector
+        if selector.checkpoint_path or selector.artifact_uri or selector.model_config_path:
+            return selector
+        data = await self._fetch_registry_model(selector.model_id)
+        if not data:
+            return selector
+        if not self._registry_status_ok(data.get("status") if isinstance(data.get("status"), str) else None):
+            raise HTTPException(status_code=403, detail="Model not allowed by ONYX_MIN_REGISTRY_STATUS")
+        # model-registry may expose local paths only in dev.
+        ckpt = data.get("local_checkpoint_path") or data.get("checkpoint_path") or data.get("artifact_uri")
+        cfgp = data.get("local_config_path") or data.get("config_path")
+        return ModelSelector(
+            model_id=selector.model_id,
+            artifact_uri=data.get("artifact_uri") if isinstance(data.get("artifact_uri"), str) else None,
+            checkpoint_path=ckpt if isinstance(ckpt, str) else None,
+            model_config_path=cfgp if isinstance(cfgp, str) else None,
+            checkpoint_sha256=data.get("checkpoint_sha256") if isinstance(data.get("checkpoint_sha256"), str) else None,
+            checkpoint_size_bytes=int(data["checkpoint_size_bytes"]) if isinstance(data.get("checkpoint_size_bytes"), int) else None,
+            config_sha256=data.get("config_sha256") if isinstance(data.get("config_sha256"), str) else None,
+            config_size_bytes=int(data["config_size_bytes"]) if isinstance(data.get("config_size_bytes"), int) else None,
+            registry_status=data.get("status") if isinstance(data.get("status"), str) else None,
+        )
+
+    async def _resolve_key(self, selector: ModelSelector) -> ModelKey:
+        selector = await self._resolve_selector(selector)
+
+        ckpt_path = None
+        cfg_path = None
+
+        if selector.model_config_path:
+            cfg_path = selector.model_config_path
+
+        # Explicit checkpoint path takes precedence (dev-only).
+        if selector.checkpoint_path:
+            ckpt_path = selector.checkpoint_path
+        elif selector.artifact_uri:
+            ckpt_path = selector.artifact_uri
+
+        if ckpt_path:
+            # Remote artifacts: resolve via artifact cache using registry-provided sha/size (or request-provided).
+            if ckpt_path.startswith("s3://"):
+                if selector.checkpoint_sha256 is None or selector.checkpoint_size_bytes is None:
+                    raise HTTPException(status_code=400, detail="Remote checkpoint requires checkpoint_sha256 and checkpoint_size_bytes")
+                ckpt_path = await self._resolve_via_artifact_cache(
+                    artifact_uri=ckpt_path,
+                    sha256=selector.checkpoint_sha256,
+                    size_bytes=selector.checkpoint_size_bytes,
+                )
+            else:
+                # Local path override (dev-only).
+                if not config.allow_local_paths:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Checkpoint path overrides are disabled (set ONYX_ALLOW_LOCAL_PATHS=1) or use model_id with artifact cache",
+                    )
+                p = _normalize_local_path(ckpt_path)
+                if not p.exists():
+                    raise HTTPException(status_code=400, detail=f"Checkpoint not found: {p}")
+                if not _is_allowed_local_path(p):
+                    raise HTTPException(status_code=400, detail=f"Checkpoint path not allowed: {p}")
+                ckpt_path = str(p)
+        else:
+            ckpt_path = config.checkpoint_path
+
+        if cfg_path:
+            if cfg_path.startswith("s3://"):
+                if selector.config_sha256 is None or selector.config_size_bytes is None:
+                    raise HTTPException(status_code=400, detail="Remote config requires config_sha256 and config_size_bytes")
+                cfg_path = await self._resolve_via_artifact_cache(
+                    artifact_uri=cfg_path,
+                    sha256=selector.config_sha256,
+                    size_bytes=selector.config_size_bytes,
+                )
+            else:
+                if not config.allow_local_paths:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Config path overrides are disabled (set ONYX_ALLOW_LOCAL_PATHS=1) or use model_id with artifact cache",
+                    )
+                p = _normalize_local_path(cfg_path)
+                if not p.exists():
+                    raise HTTPException(status_code=400, detail=f"Config not found: {p}")
+                if not _is_allowed_local_path(p):
+                    raise HTTPException(status_code=400, detail=f"Config path not allowed: {p}")
+                cfg_path = str(p)
+        else:
+            cfg_path = config.model_config_path
+
+        return ModelKey(
+            checkpoint_path=str(ckpt_path),
+            model_config_path=str(cfg_path) if cfg_path else None,
+            device=str(self._device),
+            dtype=str(self._dtype).replace("torch.", ""),
+        )
+
+    def _load_bundle_sync(self, key: ModelKey) -> ModelBundle:
+        model, model_cfg = load_onyx_model(
+            checkpoint_path=key.checkpoint_path,
+            tokenizer=self._tokenizer,
+            device=self._device,
+            dtype=self._dtype,
+            model_config_path=key.model_config_path,
+        )
+        return ModelBundle(
+            key=key,
+            model=model,
+            tokenizer=self._tokenizer,
+            device=self._device,
+            dtype=self._dtype,
+            config=model_cfg,
+        )
+
+    async def get_bundle(self, selector: ModelSelector) -> Tuple[ModelBundle, str]:
+        key = await self._resolve_key(selector)
+
+        async with self._lock:
+            if key in self._cache:
+                bundle = self._cache.pop(key)
+                self._cache[key] = bundle
+                return bundle, self._key_id(key)
+
+            fut = self._inflight.get(key)
+            if fut is None:
+                fut = asyncio.get_running_loop().create_future()
+                self._inflight[key] = fut
+                should_load = True
+            else:
+                should_load = False
+
+        if should_load:
+            try:
+                bundle = await asyncio.to_thread(self._load_bundle_sync, key)
+                async with self._lock:
+                    self._cache[key] = bundle
+                    while len(self._cache) > max(1, int(config.model_cache_size)):
+                        self._cache.popitem(last=False)
+                    fut = self._inflight.pop(key, None)
+                    if fut is not None and not fut.done():
+                        fut.set_result(bundle)
+                return bundle, self._key_id(key)
+            except Exception as e:
+                async with self._lock:
+                    fut = self._inflight.pop(key, None)
+                    if fut is not None and not fut.done():
+                        fut.set_exception(e)
+                raise
+
+        bundle = await fut
+        return bundle, self._key_id(key)
+
+    async def list_cached(self) -> List[str]:
+        async with self._lock:
+            return [self._key_id(k) for k in self._cache.keys()]
+
+    async def clear_cache(self) -> int:
+        async with self._lock:
+            n = len(self._cache)
+            self._cache.clear()
+            self._inflight.clear()
+            return n
+
+
+def _extract_selector(req: Any) -> ModelSelector:
+    return ModelSelector(
+        model_id=getattr(req, "model_id", None),
+        artifact_uri=getattr(req, "artifact_uri", None),
+        checkpoint_path=getattr(req, "checkpoint_path", None),
+        model_config_path=getattr(req, "model_config_path", None),
     )
-
-    # Load model
-    print(f"Loading checkpoint: {config.checkpoint_path}")
-    checkpoint = torch.load(config.checkpoint_path, map_location='cpu', weights_only=False)
-
-    model = Onyx(model_config)
-
-    if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
-    elif 'model' in checkpoint:
-        model.load_state_dict(checkpoint['model'])
-    else:
-        model.load_state_dict(checkpoint)
-
-    model = model.to(device=device, dtype=state.dtype)
-    model.eval()
-    state.model = model
-
-    print(f"Model loaded: {model.get_num_params():,} parameters")
 
 
 # =============================================================================
@@ -157,6 +426,8 @@ def load_model():
 # =============================================================================
 
 class GenerateRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     prompt: str
     max_tokens: int = Field(default=512, ge=1, le=4096)
     temperature: float = Field(default=0.8, ge=0.0, le=2.0)
@@ -167,6 +438,12 @@ class GenerateRequest(BaseModel):
     session_id: Optional[str] = Field(default=None, description="Session ID for memory persistence")
     system_prompt: Optional[str] = Field(default=None)
     stop_sequences: Optional[List[str]] = Field(default=None)
+    # Model selection (eval-service compatibility: accepts model_id + artifact_uri)
+    model_id: Optional[int] = Field(default=None)
+    artifact_uri: Optional[str] = Field(default=None)
+    checkpoint_path: Optional[str] = Field(default=None, description="Dev-only local checkpoint path override")
+    model_config_path: Optional[str] = Field(default=None, description="Dev-only local model config path override")
+    eval: Optional[Dict[str, Any]] = Field(default=None, description="Opaque eval metadata (ignored by server)")
 
 
 class GenerateResponse(BaseModel):
@@ -182,6 +459,8 @@ class ChatMessage(BaseModel):
 
 
 class ChatRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     messages: List[ChatMessage]
     max_tokens: int = Field(default=512, ge=1, le=4096)
     temperature: float = Field(default=0.8, ge=0.0, le=2.0)
@@ -191,6 +470,11 @@ class ChatRequest(BaseModel):
     stream: bool = Field(default=False)
     session_id: Optional[str] = Field(default=None)
     system_prompt: Optional[str] = Field(default=None)
+    model_id: Optional[int] = Field(default=None)
+    artifact_uri: Optional[str] = Field(default=None)
+    checkpoint_path: Optional[str] = Field(default=None)
+    model_config_path: Optional[str] = Field(default=None)
+    eval: Optional[Dict[str, Any]] = Field(default=None)
 
 
 class ModelInfo(BaseModel):
@@ -213,16 +497,23 @@ def sample_token(
     top_k: int = 50,
     top_p: float = 0.9,
     repetition_penalty: float = 1.0,
-    generated_tokens: Optional[torch.Tensor] = None,
+    generated_tokens: Optional[Any] = None,
 ) -> torch.Tensor:
     """Sample next token"""
 
-    if repetition_penalty != 1.0 and generated_tokens is not None and generated_tokens.numel() > 0:
-        for token_id in generated_tokens.unique():
-            if logits[0, token_id] > 0:
-                logits[0, token_id] /= repetition_penalty
-            else:
-                logits[0, token_id] *= repetition_penalty
+    if repetition_penalty != 1.0 and generated_tokens is not None:
+        if isinstance(generated_tokens, set):
+            token_ids = generated_tokens
+        elif torch.is_tensor(generated_tokens):
+            token_ids = set(int(x) for x in generated_tokens.flatten().tolist())
+        else:
+            token_ids = set(int(x) for x in generated_tokens)
+        for token_id in token_ids:
+            if 0 <= token_id < logits.size(-1):
+                if logits[0, token_id] > 0:
+                    logits[0, token_id] /= repetition_penalty
+                else:
+                    logits[0, token_id] *= repetition_penalty
 
     if temperature <= 0:
         return logits.argmax(dim=-1, keepdim=True)
@@ -258,30 +549,37 @@ async def generate_tokens(
     top_p: float,
     top_k: int,
     repetition_penalty: float,
+    bundle: ModelBundle,
+    model_key: str,
     session_id: Optional[str] = None,
     stop_sequences: Optional[List[str]] = None,
 ) -> AsyncGenerator[tuple[str, bool], None]:
     """Generate tokens, yielding each one"""
 
-    model = state.model
-    tokenizer = state.tokenizer
-    device = state.device
+    model = bundle.model
+    tokenizer = bundle.tokenizer
+    device = bundle.device
 
     input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
     B, S = input_ids.shape
 
     # Get or create memory states
-    if session_id and session_id in state.sessions:
-        memory_states = state.sessions[session_id]
+    if session_id:
+        per_model = state.sessions.setdefault(model_key, {})
+        if session_id in per_model:
+            memory_states = per_model[session_id]
+        else:
+            memory_states = model.init_memory_states(B, device, bundle.dtype)
     else:
-        memory_states = model.init_memory_states(B, device, state.dtype)
+        memory_states = model.init_memory_states(B, device, bundle.dtype)
 
     # Get stop token IDs
-    stop_token_ids = [tokenizer.eos_token_id] if tokenizer.eos_token_id else []
+    stop_token_ids = [tokenizer.eos_token_id] if getattr(tokenizer, "eos_token_id", None) else []
     for token in ["<|eot_id|>", "<|end|>", "</s>", "<|im_end|>"]:
-        token_id = tokenizer.convert_tokens_to_ids(token)
-        if token_id != tokenizer.unk_token_id:
-            stop_token_ids.append(token_id)
+        if hasattr(tokenizer, "convert_tokens_to_ids") and hasattr(tokenizer, "unk_token_id"):
+            token_id = tokenizer.convert_tokens_to_ids(token)
+            if token_id != tokenizer.unk_token_id:
+                stop_token_ids.append(token_id)
 
     # Process prompt
     with torch.no_grad():
@@ -296,7 +594,7 @@ async def generate_tokens(
         kv_cache = outputs.get("kv_cache")
         position_offset = S
 
-    generated_tokens = torch.tensor([], dtype=torch.long, device=device)
+    seen_token_ids: set[int] = set()
     generated_text = ""
 
     for _ in range(max_tokens):
@@ -309,10 +607,11 @@ async def generate_tokens(
                 top_k=top_k,
                 top_p=top_p,
                 repetition_penalty=repetition_penalty,
-                generated_tokens=generated_tokens,
+                generated_tokens=(seen_token_ids if repetition_penalty != 1.0 else None),
             )
 
-            generated_tokens = torch.cat([generated_tokens, next_token.squeeze(0)])
+            if repetition_penalty != 1.0:
+                seen_token_ids.add(int(next_token.item()))
             token_text = tokenizer.decode(next_token[0], skip_special_tokens=True)
             generated_text += token_text
 
@@ -346,7 +645,7 @@ async def generate_tokens(
 
     # Save session memory
     if session_id:
-        state.sessions[session_id] = memory_states
+        state.sessions.setdefault(model_key, {})[session_id] = memory_states
 
 
 # =============================================================================
@@ -356,7 +655,23 @@ async def generate_tokens(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load model on startup"""
-    load_model()
+    device = _select_device()
+    dtype = _select_dtype()
+    print(f"Device: {device} | Dtype: {dtype}")
+
+    print(f"Loading tokenizer: {config.tokenizer_name}")
+    state.tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name, trust_remote_code=True)
+    state.device = device
+    state.dtype = dtype
+    state.manager = ModelManager(tokenizer=state.tokenizer, device=device, dtype=dtype)
+
+    if not config.skip_startup_load:
+        print(f"Preloading default checkpoint: {config.checkpoint_path}")
+        bundle, key_id = await state.manager.get_bundle(ModelSelector())
+        state.model = bundle.model
+        state.config = bundle.config
+        state.sessions.setdefault(key_id, {})
+        print(f"Model loaded: {bundle.model.get_num_params():,} parameters")
     yield
     # Cleanup on shutdown
     state.model = None
@@ -390,7 +705,8 @@ async def root():
 async def health():
     return {
         "status": "healthy",
-        "model_loaded": state.model is not None,
+        "manager_ready": state.manager is not None,
+        "default_model_loaded": state.model is not None,
     }
 
 
@@ -413,8 +729,10 @@ async def model_info():
 @app.post("/generate", response_model=GenerateResponse)
 async def generate(request: GenerateRequest):
     """Generate text from prompt"""
-    if state.model is None:
+    if state.manager is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
+
+    bundle, model_key = await state.manager.get_bundle(_extract_selector(request))
 
     # Build prompt with system prompt if provided
     prompt = request.prompt
@@ -422,7 +740,7 @@ async def generate(request: GenerateRequest):
         prompt = f"System: {request.system_prompt}\n\nUser: {prompt}\nAssistant:"
 
     if request.stream:
-        return await generate_stream(request, prompt)
+        return await generate_stream(request, prompt, bundle=bundle, model_key=model_key)
 
     # Non-streaming generation
     start_time = time.time()
@@ -436,6 +754,8 @@ async def generate(request: GenerateRequest):
         top_p=request.top_p,
         top_k=request.top_k,
         repetition_penalty=request.repetition_penalty,
+        bundle=bundle,
+        model_key=model_key,
         session_id=request.session_id,
         stop_sequences=request.stop_sequences,
     ):
@@ -455,8 +775,19 @@ async def generate(request: GenerateRequest):
     )
 
 
-async def generate_stream(request: GenerateRequest, prompt: str):
+async def generate_stream(
+    request: GenerateRequest,
+    prompt: str,
+    *,
+    bundle: Optional[ModelBundle] = None,
+    model_key: Optional[str] = None,
+):
     """Streaming generation with SSE"""
+    if state.manager is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
+    if bundle is None or model_key is None:
+        bundle, model_key = await state.manager.get_bundle(_extract_selector(request))
 
     async def event_generator():
         start_time = time.time()
@@ -469,6 +800,8 @@ async def generate_stream(request: GenerateRequest, prompt: str):
             top_p=request.top_p,
             top_k=request.top_k,
             repetition_penalty=request.repetition_penalty,
+            bundle=bundle,
+            model_key=model_key,
             session_id=request.session_id,
             stop_sequences=request.stop_sequences,
         ):
@@ -503,8 +836,10 @@ async def generate_stream(request: GenerateRequest, prompt: str):
 @app.post("/chat")
 async def chat(request: ChatRequest):
     """Chat completion endpoint"""
-    if state.model is None:
+    if state.manager is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
+
+    bundle, model_key = await state.manager.get_bundle(_extract_selector(request))
 
     # Build prompt from messages
     prompt = ""
@@ -530,8 +865,15 @@ async def chat(request: ChatRequest):
                 repetition_penalty=request.repetition_penalty,
                 stream=True,
                 session_id=request.session_id,
+                model_id=request.model_id,
+                artifact_uri=request.artifact_uri,
+                checkpoint_path=request.checkpoint_path,
+                model_config_path=request.model_config_path,
+                eval=request.eval,
             ),
-            prompt
+            prompt,
+            bundle=bundle,
+            model_key=model_key,
         )
 
     # Non-streaming
@@ -546,6 +888,8 @@ async def chat(request: ChatRequest):
         top_p=request.top_p,
         top_k=request.top_k,
         repetition_penalty=request.repetition_penalty,
+        bundle=bundle,
+        model_key=model_key,
         session_id=request.session_id,
     ):
         generated_text += token_text
@@ -567,16 +911,43 @@ async def chat(request: ChatRequest):
 @app.delete("/session/{session_id}")
 async def delete_session(session_id: str):
     """Delete a session's memory state"""
-    if session_id in state.sessions:
-        del state.sessions[session_id]
-        return {"status": "deleted", "session_id": session_id}
+    deleted = 0
+    for mk in list(state.sessions.keys()):
+        if session_id in state.sessions.get(mk, {}):
+            del state.sessions[mk][session_id]
+            deleted += 1
+    if deleted:
+        return {"status": "deleted", "session_id": session_id, "deleted_count": deleted}
     raise HTTPException(status_code=404, detail="Session not found")
 
 
 @app.get("/sessions")
 async def list_sessions():
     """List active sessions"""
-    return {"sessions": list(state.sessions.keys())}
+    out: Dict[str, Any] = {}
+    for mk, sess in state.sessions.items():
+        out[mk] = list(sess.keys())
+    return {"sessions": out}
+
+
+@app.get("/models_loaded")
+async def models_loaded():
+    """List cached model bundles (LRU order)."""
+    if state.manager is None:
+        raise HTTPException(status_code=503, detail="Model manager not initialized")
+    return {"models": await state.manager.list_cached()}
+
+
+@app.post("/cache/clear")
+async def clear_cache():
+    """Clear cached models and session memories."""
+    if state.manager is None:
+        raise HTTPException(status_code=503, detail="Model manager not initialized")
+    n = await state.manager.clear_cache()
+    state.sessions.clear()
+    state.model = None
+    state.config = None
+    return {"cleared_models": n, "cleared_sessions": True}
 
 
 if __name__ == "__main__":
